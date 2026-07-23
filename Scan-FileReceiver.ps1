@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    C段存活主机自定义端口 Web 服务探测脚本，抓取根路径 title。
+    自定义网段/端口 Web 服务探测脚本，抓取根路径 title。
 
 .说明（务必阅读）
     本脚本仅可用于你拥有明确授权的网络/资产（内部资产梳理、授权渗透测试等）。
@@ -8,20 +8,36 @@
 
 .用法
     在 PowerShell ISE 或 PowerShell 7+ 中运行：
-    .\Scan-WebTitle.ps1 -Subnet 192.168.1 -Ports "80,443,7000-9999" -Threads 200
+    .\Scan-WebTitle.ps1 -Target 192.168.1 -Ports "80,443,7000-9999" -Threads 200
+    .\Scan-WebTitle.ps1 -TargetFile .\ips.txt -Ports "80,443,7000-9999"
 
 .参数
-    -Subnet     C段前缀，例如 192.168.1（会扫描 192.168.1.1 - 192.168.1.254）
+    -Target     目标网段，支持以下写法：
+                  C段简写   "192.168.1"                -> 等价于 192.168.1.0/24 (.1-.254)
+                  B段简写   "192.168"                   -> 等价于 192.168.0.0/16 (6万+地址，会有数量确认提示)
+                  CIDR      "172.16.0.0/16" "10.1.2.0/28" -> 任意掩码
+                  IP范围    "192.168.1.1-192.168.3.254"  -> 起止IP范围
+                  单个IP    "192.168.1.10"
+    -TargetFile 从文件读取目标列表，每行一条，支持上面 -Target 的所有写法混合，
+                以 # 开头的行当注释忽略，空行忽略。可与 -Target 同时使用，结果会合并去重。
+                示例文件内容：
+                    # 生产网段
+                    192.168.1.0/24
+                    10.0.5.10
+                    192.168.2.100-192.168.2.200
     -Ports      要探测的端口，支持单个/逗号分隔/范围混合，例如 "80,443,8000-8090,7000-9999"
     -Threads    并发线程数（Runspace 数），默认 200
     -Timeout    TCP/HTTP 超时（毫秒），默认 800
     -OutFile    结果输出 CSV 路径
     -StatusFilter  只记录指定状态码的结果，逗号分隔，例如 "200,403,405"；不指定则记录所有能拿到响应的结果
+    -Force      目标IP数量超过 65536 时，需要加此开关才会继续（防止误操作扫超大范围）
 #>
 
 param(
-    [Parameter(Mandatory = $true)]
-    [string]$Subnet,
+    [Alias('Subnet')]
+    [string]$Target,
+
+    [string]$TargetFile,
 
     [Parameter(Mandatory = $true)]
     [string]$Ports,
@@ -32,9 +48,117 @@ param(
     [string]$StatusFilter = "",
 
     # 内网很多主机会屏蔽 ICMP/常见端口，可能导致第一步误判为"不存活"。
-    # 如果发现存活主机数偏少/漏了，加上此开关直接对整个C段扫端口，更保险（但更慢）。
-    [switch]$SkipHostDiscovery
+    # 如果发现存活主机数偏少/漏了，加上此开关直接对整个目标段扫端口，更保险（但更慢）。
+    [switch]$SkipHostDiscovery,
+
+    # 目标IP数量超过65536（比如整个B段）时需要加此开关确认继续
+    [switch]$Force
 )
+
+# ---------- IP <-> UInt32 互转 ----------
+function ConvertTo-UInt32IP([string]$ip) {
+    $b = $ip.Split('.')
+    return ([uint64]$b[0] * 16777216) + ([uint64]$b[1] * 65536) + ([uint64]$b[2] * 256) + [uint64]$b[3]
+}
+function ConvertFrom-UInt32IP([uint64]$val) {
+    $o1 = [math]::Floor($val / 16777216) % 256
+    $o2 = [math]::Floor($val / 65536) % 256
+    $o3 = [math]::Floor($val / 256) % 256
+    $o4 = $val % 256
+    return "$o1.$o2.$o3.$o4"
+}
+
+# ---------- 解析 -Target，支持 C段简写 / B段简写 / CIDR / IP范围 / 单IP ----------
+function Resolve-TargetIPs([string]$target) {
+    $target = $target.Trim()
+
+    # CIDR: a.b.c.d/nn
+    if ($target -match '^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/(\d{1,2})$') {
+        $baseIp = $matches[1]; $prefix = [int]$matches[2]
+        $ipVal = ConvertTo-UInt32IP $baseIp
+        $maskVal = if ($prefix -eq 0) { 0 } else { ([uint64]0xFFFFFFFF -shl (32 - $prefix)) -band 0xFFFFFFFF }
+        $network = $ipVal -band $maskVal
+        $hostBits = 32 - $prefix
+        $count = [uint64][math]::Pow(2, $hostBits)
+        $first = $network + 1
+        $last = $network + $count - 2
+        if ($prefix -ge 31) { $first = $network; $last = $network + $count - 1 } # /31,/32 特殊情况
+        return $first..$last | ForEach-Object { ConvertFrom-UInt32IP $_ }
+    }
+
+    # IP范围: a.b.c.d-a.b.c.d
+    if ($target -match '^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})-(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$') {
+        $startVal = ConvertTo-UInt32IP $matches[1]
+        $endVal   = ConvertTo-UInt32IP $matches[2]
+        if ($startVal -gt $endVal) { $tmp = $startVal; $startVal = $endVal; $endVal = $tmp }
+        return $startVal..$endVal | ForEach-Object { ConvertFrom-UInt32IP $_ }
+    }
+
+    # 单个完整IP: a.b.c.d
+    if ($target -match '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$') {
+        return @($target)
+    }
+
+    # C段简写: a.b.c -> a.b.c.0/24
+    if ($target -match '^\d{1,3}\.\d{1,3}\.\d{1,3}$') {
+        return 1..254 | ForEach-Object { "$target.$_" }
+    }
+
+    # B段简写: a.b -> a.b.0.0/16
+    if ($target -match '^\d{1,3}\.\d{1,3}$') {
+        $network = ConvertTo-UInt32IP "$target.0.0"
+        $first = $network + 1
+        $last = $network + 65534
+        return $first..$last | ForEach-Object { ConvertFrom-UInt32IP $_ }
+    }
+
+    throw "无法识别的 -Target 写法: $target"
+}
+
+if (-not $Target -and -not $TargetFile) {
+    Write-Host "[!] 请至少指定 -Target 或 -TargetFile 其中一个。" -ForegroundColor Red
+    return
+}
+
+$allIps = [System.Collections.Generic.List[string]]::new()
+
+if ($Target) {
+    try {
+        $resolved = Resolve-TargetIPs -target $Target
+        $allIps.AddRange([string[]]$resolved)
+        Write-Host "[*] -Target '$Target' 解析出 $($resolved.Count) 个IP" -ForegroundColor Cyan
+    } catch {
+        Write-Host "[!] $($_.Exception.Message)" -ForegroundColor Red
+        return
+    }
+}
+
+if ($TargetFile) {
+    if (-not (Test-Path $TargetFile)) {
+        Write-Host "[!] 找不到文件: $TargetFile" -ForegroundColor Red
+        return
+    }
+    $lines = Get-Content -Path $TargetFile | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' -and -not $_.StartsWith('#') }
+    $fileIpCount = 0
+    foreach ($line in $lines) {
+        try {
+            $resolved = Resolve-TargetIPs -target $line
+            $allIps.AddRange([string[]]$resolved)
+            $fileIpCount += $resolved.Count
+        } catch {
+            Write-Host "[!] 忽略文件中无法识别的行: $line" -ForegroundColor Yellow
+        }
+    }
+    Write-Host "[*] -TargetFile '$TargetFile' 解析出 $fileIpCount 个IP（共 $($lines.Count) 行）" -ForegroundColor Cyan
+}
+
+$ipList = $allIps | Sort-Object -Unique
+Write-Host "[*] 目标去重后共 $($ipList.Count) 个IP" -ForegroundColor Cyan
+
+if ($ipList.Count -gt 65536 -and -not $Force) {
+    Write-Host "[!] 目标IP数量($($ipList.Count))超过65536，可能耗时很长。确认无误后请加上 -Force 参数重新执行。" -ForegroundColor Red
+    return
+}
 
 # ---------- 解析端口参数："80,443,8000-8090,7000-9999" -> 端口数组 ----------
 function Parse-PortList([string]$portStr) {
@@ -88,14 +212,12 @@ public class TrustAllCertsPolicy {
 $Results = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
 
 # ---------- 存活探测：TCP 快速判活 + ICMP（逻辑直接内联进 ScriptBlock，避免跨 Runspace 传函数失效） ----------
-$ipList = 1..254 | ForEach-Object { "$Subnet.$_" }
-
 if ($SkipHostDiscovery) {
-    Write-Host "[*] 已跳过存活探测，直接对整个 C 段 ($($ipList.Count) 个IP) 扫端口..." -ForegroundColor Cyan
+    Write-Host "[*] 已跳过存活探测，直接对全部 $($ipList.Count) 个IP 扫端口..." -ForegroundColor Cyan
     $aliveList = $ipList
 } else {
 
-Write-Host "[*] 第一步：探测 $Subnet.1 - $Subnet.254 存活主机..." -ForegroundColor Cyan
+Write-Host "[*] 第一步：探测 $($ipList.Count) 个IP 的存活情况..." -ForegroundColor Cyan
 
 $aliveHosts = [System.Collections.Concurrent.ConcurrentBag[string]]::new()
 
