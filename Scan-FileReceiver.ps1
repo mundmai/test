@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    C段存活主机 7000-9999 端口 Web 服务探测脚本，检测 /FileReceiver 路径。
+    C段存活主机自定义端口 Web 服务探测脚本，抓取根路径 title。
 
 .说明（务必阅读）
     本脚本仅可用于你拥有明确授权的网络/资产（内部资产梳理、授权渗透测试等）。
@@ -8,31 +8,65 @@
 
 .用法
     在 PowerShell ISE 或 PowerShell 7+ 中运行：
-    .\Scan-FileReceiver.ps1 -Subnet 192.168.1 -StartPort 7000 -EndPort 9999 -Threads 200
+    .\Scan-WebTitle.ps1 -Subnet 192.168.1 -Ports "80,443,7000-9999" -Threads 200
 
 .参数
     -Subnet     C段前缀，例如 192.168.1（会扫描 192.168.1.1 - 192.168.1.254）
-    -StartPort  起始端口，默认 7000
-    -EndPort    结束端口，默认 9999
+    -Ports      要探测的端口，支持单个/逗号分隔/范围混合，例如 "80,443,8000-8090,7000-9999"
     -Threads    并发线程数（Runspace 数），默认 200
     -Timeout    TCP/HTTP 超时（毫秒），默认 800
     -OutFile    结果输出 CSV 路径
+    -StatusFilter  只记录指定状态码的结果，逗号分隔，例如 "200,403,405"；不指定则记录所有能拿到响应的结果
 #>
 
 param(
     [Parameter(Mandatory = $true)]
     [string]$Subnet,
 
-    [int]$StartPort = 7000,
-    [int]$EndPort   = 9999,
+    [Parameter(Mandatory = $true)]
+    [string]$Ports,
+
     [int]$Threads   = 200,
     [int]$Timeout   = 800,
-    [string]$OutFile = ".\FileReceiver_Results_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv",
+    [string]$OutFile = ".\WebTitle_Results_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv",
+    [string]$StatusFilter = "",
 
     # 内网很多主机会屏蔽 ICMP/常见端口，可能导致第一步误判为"不存活"。
     # 如果发现存活主机数偏少/漏了，加上此开关直接对整个C段扫端口，更保险（但更慢）。
     [switch]$SkipHostDiscovery
 )
+
+# ---------- 解析端口参数："80,443,8000-8090,7000-9999" -> 端口数组 ----------
+function Parse-PortList([string]$portStr) {
+    $ports = [System.Collections.Generic.HashSet[int]]::new()
+    foreach ($part in ($portStr -split ',')) {
+        $part = $part.Trim()
+        if ($part -eq '') { continue }
+        if ($part -match '^(\d+)-(\d+)$') {
+            $s = [int]$matches[1]; $e = [int]$matches[2]
+            if ($s -gt $e) { $tmp = $s; $s = $e; $e = $tmp }
+            for ($p = $s; $p -le $e; $p++) { [void]$ports.Add($p) }
+        } elseif ($part -match '^\d+$') {
+            [void]$ports.Add([int]$part)
+        } else {
+            Write-Host "[!] 忽略无法识别的端口写法: $part" -ForegroundColor Yellow
+        }
+    }
+    return ($ports | Sort-Object)
+}
+
+$PortList = Parse-PortList -portStr $Ports
+if ($PortList.Count -eq 0) {
+    Write-Host "[!] 端口参数解析为空，请检查 -Ports 写法。" -ForegroundColor Red
+    return
+}
+Write-Host "[*] 待探测端口数量: $($PortList.Count)" -ForegroundColor Cyan
+
+$StatusFilterList = @()
+if ($StatusFilter -ne "") {
+    $StatusFilterList = $StatusFilter -split ',' | ForEach-Object { [int]$_.Trim() }
+    Write-Host "[*] 仅记录状态码: $($StatusFilterList -join ', ')" -ForegroundColor Cyan
+}
 
 # ---------- 忽略无效 SSL 证书（仅用于探测，不做任何利用行为） ----------
 Add-Type @"
@@ -126,16 +160,60 @@ if ($aliveList.Count -eq 0) {
 }
 
 # ---------- 第二步：端口 + Web 探测 ----------
-Write-Host "[*] 第二步：探测端口 $StartPort-$EndPort 并检测 /FileReceiver ..." -ForegroundColor Cyan
+Write-Host "[*] 第二步：探测指定端口并抓取 Web 服务 title ..." -ForegroundColor Cyan
 
 $targets = foreach ($ip in $aliveList) {
-    foreach ($port in $StartPort..$EndPort) {
+    foreach ($port in $PortList) {
         [PSCustomObject]@{ IP = $ip; Port = $port }
     }
 }
 
 $ScriptBlock = {
-    param($IP, $Port, $Timeout, $Results)
+    param($IP, $Port, $Timeout, $Results, $StatusFilterList)
+
+    # 提取 <title> 的小函数（内联写，避免跨 Runspace 传函数失效的老问题）
+    function Get-PageTitle($body) {
+        if ([string]::IsNullOrEmpty($body)) { return "" }
+        $m = [regex]::Match($body, '<title[^>]*>\s*(.*?)\s*</title>', 'IgnoreCase, Singleline')
+        if ($m.Success) {
+            $t = [System.Net.WebUtility]::HtmlDecode($m.Groups[1].Value)
+            return ($t -replace '\s+', ' ').Trim()
+        }
+        return ""
+    }
+
+    # 发起请求，返回 [状态码, 响应体(最多读8KB用于取title)]
+    function Invoke-Probe($url, $Timeout) {
+        $code = $null
+        $body = ""
+        try {
+            $req = [System.Net.HttpWebRequest]::Create($url)
+            $req.Method = "GET"
+            $req.Timeout = $Timeout
+            $req.ReadWriteTimeout = $Timeout
+            $req.AllowAutoRedirect = $false
+            $req.UserAgent = "Mozilla/5.0 (AssetScan)"
+            $resp = $null
+            try {
+                $resp = $req.GetResponse()
+            } catch [System.Net.WebException] {
+                if ($_.Exception.Response) { $resp = $_.Exception.Response }
+            }
+            if ($resp) {
+                $code = [int]$resp.StatusCode
+                try {
+                    $stream = $resp.GetResponseStream()
+                    $buffer = New-Object byte[] 8192
+                    $read = $stream.Read($buffer, 0, $buffer.Length)
+                    if ($read -gt 0) {
+                        $body = [System.Text.Encoding]::UTF8.GetString($buffer, 0, $read)
+                    }
+                } catch {}
+                $resp.Close()
+            }
+        } catch { }
+        return @($code, $body)
+    }
 
     # 1. TCP 端口连通性
     try {
@@ -149,47 +227,40 @@ $ScriptBlock = {
         $client.Close()
     } catch { return }
 
-    # 2. 判断 HTTP / HTTPS，并请求 /FileReceiver
+    # 2. 判断 HTTP / HTTPS：访问根路径，能拿到响应就视为 Web 服务，并提取 title
     $schemes = @('http', 'https')
     foreach ($scheme in $schemes) {
-        $url = "$scheme`://$IP`:$Port/FileReceiver"
-        try {
-            $req = [System.Net.HttpWebRequest]::Create($url)
-            $req.Method = "GET"
-            $req.Timeout = $Timeout
-            $req.ReadWriteTimeout = $Timeout
-            $req.AllowAutoRedirect = $false
-            $req.UserAgent = "Mozilla/5.0 (AssetScan)"
-            try {
-                $resp = $req.GetResponse()
-                $code = [int]$resp.StatusCode
-                $resp.Close()
-            } catch [System.Net.WebException] {
-                if ($_.Exception.Response) {
-                    $code = [int]$_.Exception.Response.StatusCode
-                    $_.Exception.Response.Close()
-                } else {
-                    $code = $null
-                }
-            }
 
-            if ($code -in 200, 403, 405) {
-                $Results.Add([PSCustomObject]@{
-                    IP     = $IP
-                    Port   = $Port
-                    Scheme = $scheme
-                    URL    = $url
-                    Status = $code
-                    Time   = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
-                })
-                Write-Host "[HIT] $url -> $code" -ForegroundColor Green
-            }
-            # 只要这个 scheme 能建立 HTTP 通信（不管状态码），就不必再试另一个 scheme
-            if ($code) { break }
-        } catch {
-            # 该 scheme 请求失败（连接被拒/协议不匹配等），尝试下一个 scheme
+        $rootUrl = "$scheme`://$IP`:$Port/"
+        $rootResult = Invoke-Probe -url $rootUrl -Timeout $Timeout
+        $rootCode = $rootResult[0]
+        $rootBody = $rootResult[1]
+
+        if (-not $rootCode) {
+            # 该 scheme 完全连不通（协议不匹配等），尝试下一个 scheme
             continue
         }
+
+        $title = Get-PageTitle $rootBody
+
+        # 3. 是否记录：未指定 -StatusFilter 时记录所有拿到响应的结果；指定了则按状态码过滤
+        $shouldRecord = ($StatusFilterList.Count -eq 0) -or ($rootCode -in $StatusFilterList)
+
+        if ($shouldRecord) {
+            $Results.Add([PSCustomObject]@{
+                IP     = $IP
+                Port   = $Port
+                Scheme = $scheme
+                Title  = $title
+                URL    = $rootUrl
+                Status = $rootCode
+                Time   = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+            })
+            Write-Host "[HIT] $rootUrl -> $rootCode  Title: $title" -ForegroundColor Green
+        }
+
+        # 该 scheme 已确认是 Web（能拿到根路径响应），不用再试另一个 scheme
+        break
     }
 }
 
@@ -199,7 +270,7 @@ $rsPool2.Open()
 $jobs2 = foreach ($t in $targets) {
     $ps = [powershell]::Create()
     $ps.RunspacePool = $rsPool2
-    [void]$ps.AddScript($ScriptBlock).AddArgument($t.IP).AddArgument($t.Port).AddArgument($Timeout).AddArgument($Results)
+    [void]$ps.AddScript($ScriptBlock).AddArgument($t.IP).AddArgument($t.Port).AddArgument($Timeout).AddArgument($Results).AddArgument($StatusFilterList)
     [PSCustomObject]@{ Pipe = $ps; Handle = $ps.BeginInvoke() }
 }
 
@@ -226,5 +297,5 @@ if ($finalResults.Count -gt 0) {
     $finalResults | Export-Csv -Path $OutFile -NoTypeInformation -Encoding UTF8
     Write-Host "[+] 完成，共 $($finalResults.Count) 条命中记录，已保存至: $OutFile" -ForegroundColor Green
 } else {
-    Write-Host "[*] 完成，未发现符合条件（200/403/405）的记录。" -ForegroundColor Yellow
+    Write-Host "[*] 完成，未发现符合条件的记录。" -ForegroundColor Yellow
 }
