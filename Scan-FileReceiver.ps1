@@ -6,54 +6,46 @@
     本脚本仅可用于你拥有明确授权的网络/资产（内部资产梳理、授权渗透测试等）。
     禁止用于未授权的第三方网络扫描。使用前请确认已获得书面授权。
 
-.用法
-    在 PowerShell ISE 或 PowerShell 7+ 中运行：
-    .\Scan-WebTitle.ps1 -Target 192.168.1 -Ports "80,443,7000-9999" -Threads 200
-    .\Scan-WebTitle.ps1 -TargetFile .\ips.txt -Ports "80,443,7000-9999"
+.用法（ISE 直接粘贴运行）
+    把整段代码粘贴进 PowerShell ISE，直接修改下面【配置区】里的变量值，
+    然后按 F5（或点绿色播放按钮）运行即可，不需要在命令行传参数。
 
-.参数
-    -Target     目标网段，支持以下写法：
-                  C段简写   "192.168.1"                -> 等价于 192.168.1.0/24 (.1-.254)
-                  B段简写   "192.168"                   -> 等价于 192.168.0.0/16 (6万+地址，会有数量确认提示)
-                  CIDR      "172.16.0.0/16" "10.1.2.0/28" -> 任意掩码
-                  IP范围    "192.168.1.1-192.168.3.254"  -> 起止IP范围
-                  单个IP    "192.168.1.10"
-    -TargetFile 从文件读取目标列表，每行一条，支持上面 -Target 的所有写法混合，
-                以 # 开头的行当注释忽略，空行忽略。可与 -Target 同时使用，结果会合并去重。
-                示例文件内容：
-                    # 生产网段
-                    192.168.1.0/24
-                    10.0.5.10
-                    192.168.2.100-192.168.2.200
-    -Ports      要探测的端口，支持单个/逗号分隔/范围混合，例如 "80,443,8000-8090,7000-9999"
-    -Threads    并发线程数（Runspace 数），默认 200
-    -Timeout    TCP/HTTP 超时（毫秒），默认 800
-    -OutFile    结果输出 CSV 路径
-    -StatusFilter  只记录指定状态码的结果，逗号分隔，例如 "200,403,405"；不指定则记录所有能拿到响应的结果
-    -Force      目标IP数量超过 65536 时，需要加此开关才会继续（防止误操作扫超大范围）
+.配置区说明
+    $Target         目标网段，支持以下写法（留空则忽略，只用 $TargetFile）：
+                      C段简写   "192.168.1"                -> 等价于 192.168.1.0/24 (.1-.254)
+                      B段简写   "192.168"                   -> 等价于 192.168.0.0/16 (6万+地址)
+                      CIDR      "172.16.0.0/16" "10.1.2.0/28" -> 任意掩码
+                      IP范围    "192.168.1.1-192.168.3.254"  -> 起止IP范围
+                      单个IP    "192.168.1.10"
+    $TargetFile     从文件读取目标列表路径，每行一条，写法同上，支持混合。
+                    以 # 开头的行当注释忽略，空行忽略。可与 $Target 同时使用，结果合并去重。
+                    留空字符串 "" 表示不使用文件。
+    $Ports          要探测的端口，支持单个/逗号分隔/范围混合，例如 "80,443,8000-8090,7000-9999"
+    $Threads        并发线程数，默认 200
+    $Timeout        TCP/HTTP 超时（毫秒），默认 800
+    $OutFile        结果输出 CSV 路径
+    $StatusFilter   只记录指定状态码，逗号分隔，例如 "200,403,405"；留空 "" 则记录所有能拿到响应的结果
+    $SkipHostDiscovery  $true/$false，是否跳过存活探测直接扫全部目标IP的端口
+    $Force          $true/$false，目标IP数量超过65536时是否强制继续
 #>
 
-param(
-    [Alias('Subnet')]
-    [string]$Target,
+# =====================================================================
+# ======================== 【配置区】在此修改 ==========================
+# =====================================================================
 
-    [string]$TargetFile,
+$Target            = "192.168.1"                # 目标网段/IP/CIDR/范围，留空 "" 则只用 $TargetFile
+$TargetFile        = ""                          # IP列表文件路径，例如 "C:\ips.txt"，不用则留空 ""
+$Ports             = "80,443,7000-9999"          # 要探测的端口
+$Threads           = 200                         # 并发数
+$Timeout           = 800                         # 超时(毫秒)
+$OutFile           = ".\WebTitle_Results_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+$StatusFilter      = ""                          # 例如 "200,403,405"，留空则记录所有响应
+$SkipHostDiscovery = $false                      # $true 则跳过存活探测，直接扫全部目标IP
+$Force             = $false                      # $true 则允许目标IP数超过65536继续执行
 
-    [Parameter(Mandatory = $true)]
-    [string]$Ports,
-
-    [int]$Threads   = 200,
-    [int]$Timeout   = 800,
-    [string]$OutFile = ".\WebTitle_Results_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv",
-    [string]$StatusFilter = "",
-
-    # 内网很多主机会屏蔽 ICMP/常见端口，可能导致第一步误判为"不存活"。
-    # 如果发现存活主机数偏少/漏了，加上此开关直接对整个目标段扫端口，更保险（但更慢）。
-    [switch]$SkipHostDiscovery,
-
-    # 目标IP数量超过65536（比如整个B段）时需要加此开关确认继续
-    [switch]$Force
-)
+# =====================================================================
+# ======================== 以下为脚本逻辑，无需修改 =====================
+# =====================================================================
 
 # ---------- IP <-> UInt32 互转 ----------
 function ConvertTo-UInt32IP([string]$ip) {
@@ -116,7 +108,7 @@ function Resolve-TargetIPs([string]$target) {
 }
 
 if (-not $Target -and -not $TargetFile) {
-    Write-Host "[!] 请至少指定 -Target 或 -TargetFile 其中一个。" -ForegroundColor Red
+    Write-Host "[!] 请在【配置区】至少设置 `$Target 或 `$TargetFile 其中一个。" -ForegroundColor Red
     return
 }
 
@@ -156,7 +148,7 @@ $ipList = $allIps | Sort-Object -Unique
 Write-Host "[*] 目标去重后共 $($ipList.Count) 个IP" -ForegroundColor Cyan
 
 if ($ipList.Count -gt 65536 -and -not $Force) {
-    Write-Host "[!] 目标IP数量($($ipList.Count))超过65536，可能耗时很长。确认无误后请加上 -Force 参数重新执行。" -ForegroundColor Red
+    Write-Host "[!] 目标IP数量($($ipList.Count))超过65536，可能耗时很长。确认无误后请把【配置区】里的 `$Force 改成 `$true 再重新运行。" -ForegroundColor Red
     return
 }
 
