@@ -27,7 +27,11 @@ param(
     [int]$EndPort   = 9999,
     [int]$Threads   = 200,
     [int]$Timeout   = 800,
-    [string]$OutFile = ".\FileReceiver_Results_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+    [string]$OutFile = ".\FileReceiver_Results_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv",
+
+    # 内网很多主机会屏蔽 ICMP/常见端口，可能导致第一步误判为"不存活"。
+    # 如果发现存活主机数偏少/漏了，加上此开关直接对整个C段扫端口，更保险（但更慢）。
+    [switch]$SkipHostDiscovery
 )
 
 # ---------- 忽略无效 SSL 证书（仅用于探测，不做任何利用行为） ----------
@@ -49,52 +53,62 @@ public class TrustAllCertsPolicy {
 # ---------- 结果同步集合 ----------
 $Results = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
 
-# ---------- 存活探测：TCP 快速判活（比 ICMP 更稳，避免被禁 ping） ----------
-function Test-HostAlive {
-    param([string]$IP)
-    # 用几个常见端口快速判断主机是否存活，命中一个即视为存活
-    $commonPorts = @(80, 443, 22, 445, 3389, 8080)
+# ---------- 存活探测：TCP 快速判活 + ICMP（逻辑直接内联进 ScriptBlock，避免跨 Runspace 传函数失效） ----------
+$ipList = 1..254 | ForEach-Object { "$Subnet.$_" }
+
+if ($SkipHostDiscovery) {
+    Write-Host "[*] 已跳过存活探测，直接对整个 C 段 ($($ipList.Count) 个IP) 扫端口..." -ForegroundColor Cyan
+    $aliveList = $ipList
+} else {
+
+Write-Host "[*] 第一步：探测 $Subnet.1 - $Subnet.254 存活主机..." -ForegroundColor Cyan
+
+$aliveHosts = [System.Collections.Concurrent.ConcurrentBag[string]]::new()
+
+$AliveScriptBlock = {
+    param($IP, $aliveHosts)
+
+    $isAlive = $false
+
+    # 1. 常见端口快速 TCP 判活
+    $commonPorts = @(80, 443, 22, 445, 3389, 8080, 135, 139)
     foreach ($p in $commonPorts) {
         try {
             $client = New-Object System.Net.Sockets.TcpClient
             $iar = $client.BeginConnect($IP, $p, $null, $null)
             $ok = $iar.AsyncWaitHandle.WaitOne(300, $false)
             if ($ok -and $client.Connected) {
+                $isAlive = $true
                 $client.Close()
-                return $true
+                break
             }
             $client.Close()
         } catch {}
     }
-    # 补充 ICMP 一次
-    try {
-        $ping = New-Object System.Net.NetworkInformation.Ping
-        $reply = $ping.Send($IP, 300)
-        if ($reply.Status -eq 'Success') { return $true }
-    } catch {}
-    return $false
+
+    # 2. 端口都没命中的话，再补一次 ICMP
+    if (-not $isAlive) {
+        try {
+            $ping = New-Object System.Net.NetworkInformation.Ping
+            $reply = $ping.Send($IP, 500)
+            if ($reply.Status -eq 'Success') { $isAlive = $true }
+        } catch {}
+    }
+
+    if ($isAlive) { $aliveHosts.Add($IP) }
 }
-
-Write-Host "[*] 第一步：探测 $Subnet.1 - $Subnet.254 存活主机..." -ForegroundColor Cyan
-
-$aliveHosts = [System.Collections.Concurrent.ConcurrentBag[string]]::new()
-
-$ipList = 1..254 | ForEach-Object { "$Subnet.$_" }
 
 $rsPool1 = [runspacefactory]::CreateRunspacePool(1, $Threads)
 $rsPool1.Open()
 $jobs1 = foreach ($ip in $ipList) {
     $ps = [powershell]::Create()
     $ps.RunspacePool = $rsPool1
-    [void]$ps.AddScript({
-        param($ip, $aliveHosts, $funcDef)
-        Invoke-Expression $funcDef
-        if (Test-HostAlive -IP $ip) { $aliveHosts.Add($ip) }
-    }).AddArgument($ip).AddArgument($aliveHosts).AddArgument(${function:Test-HostAlive}.ToString())
+    [void]$ps.AddScript($AliveScriptBlock).AddArgument($ip).AddArgument($aliveHosts)
     [PSCustomObject]@{ Pipe = $ps; Handle = $ps.BeginInvoke() }
 }
 $jobs1 | ForEach-Object {
-    $_.Pipe.EndInvoke($_.Handle) | Out-Null
+    try { $_.Pipe.EndInvoke($_.Handle) | Out-Null }
+    catch { Write-Host "[!] 存活探测异常: $($_.Exception.Message)" -ForegroundColor DarkYellow }
     $_.Pipe.Dispose()
 }
 $rsPool1.Close()
@@ -103,6 +117,8 @@ $rsPool1.Dispose()
 $aliveList = $aliveHosts | Sort-Object -Unique
 Write-Host "[+] 存活主机数量: $($aliveList.Count)" -ForegroundColor Green
 $aliveList | ForEach-Object { Write-Host "    $_" }
+
+} # end else (SkipHostDiscovery)
 
 if ($aliveList.Count -eq 0) {
     Write-Host "[!] 未发现存活主机，退出。" -ForegroundColor Yellow
