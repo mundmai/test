@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    自定义网段/端口 Web 服务探测脚本，抓取根路径 title。
+    自定义网段/端口 Web 服务探测脚本，抓取根路径 title / length / 301302跳转目标。
 
 .说明（务必阅读）
     本脚本仅可用于你拥有明确授权的网络/资产（内部资产梳理、授权渗透测试等）。
@@ -22,8 +22,10 @@
                     留空字符串 "" 表示不使用文件。
     $Ports          要探测的端口，支持单个/逗号分隔/范围混合，例如 "80,443,8000-8090,7000-9999"
     $Threads        并发线程数，默认 200
-    $Timeout        TCP/HTTP 超时（毫秒），默认 800
-    $OutFile        结果输出 CSV 路径
+    $Timeout        基础超时（毫秒），默认 1000；https 会在此基础上自动多留一些余量应对TLS握手
+    $OutFile        结果保存路径，留空 "" 则不保存文件，只在控制台显示。
+                    指定路径时按后缀名决定格式：.csv / .json / 其他(纯文本，制表符分隔)
+                    例如 "C:\result.csv"、".\result.json"、".\result.txt"
     $StatusFilter   只记录指定状态码，逗号分隔，例如 "200,403,405"；留空 "" 则记录所有能拿到响应的结果
     $SkipHostDiscovery  $true/$false，是否跳过存活探测直接扫全部目标IP的端口
     $Force          $true/$false，目标IP数量超过65536时是否强制继续
@@ -37,8 +39,8 @@ $Target            = "192.168.1"                # 目标网段/IP/CIDR/范围，
 $TargetFile        = ""                          # IP列表文件路径，例如 "C:\ips.txt"，不用则留空 ""
 $Ports             = "80,443,7000-9999"          # 要探测的端口
 $Threads           = 200                         # 并发数
-$Timeout           = 800                         # 超时(毫秒)
-$OutFile           = ".\WebTitle_Results_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+$Timeout           = 1000                        # 基础超时(毫秒)，https会自动再加余量
+$OutFile           = ""                          # 留空则不保存文件；例如 ".\result.csv" ".\result.json" ".\result.txt"
 $StatusFilter      = ""                          # 例如 "200,403,405"，留空则记录所有响应
 $SkipHostDiscovery = $false                      # $true 则跳过存活探测，直接扫全部目标IP
 $Force             = $false                      # $true 则允许目标IP数超过65536继续执行
@@ -60,7 +62,7 @@ function ConvertFrom-UInt32IP([uint64]$val) {
     return "$o1.$o2.$o3.$o4"
 }
 
-# ---------- 解析 -Target，支持 C段简写 / B段简写 / CIDR / IP范围 / 单IP ----------
+# ---------- 解析 Target，支持 C段简写 / B段简写 / CIDR / IP范围 / 单IP ----------
 function Resolve-TargetIPs([string]$target) {
     $target = $target.Trim()
 
@@ -104,28 +106,28 @@ function Resolve-TargetIPs([string]$target) {
         return $first..$last | ForEach-Object { ConvertFrom-UInt32IP $_ }
     }
 
-    throw "无法识别的 -Target 写法: $target"
+    throw "无法识别的目标写法: $target"
 }
 
-if (-not $Target -and -not $TargetFile) {
+if ((-not $Target -or $Target.Trim() -eq '') -and (-not $TargetFile -or $TargetFile.Trim() -eq '')) {
     Write-Host "[!] 请在【配置区】至少设置 `$Target 或 `$TargetFile 其中一个。" -ForegroundColor Red
     return
 }
 
 $allIps = [System.Collections.Generic.List[string]]::new()
 
-if ($Target) {
+if ($Target -and $Target.Trim() -ne '') {
     try {
         $resolved = Resolve-TargetIPs -target $Target
         $allIps.AddRange([string[]]$resolved)
-        Write-Host "[*] -Target '$Target' 解析出 $($resolved.Count) 个IP" -ForegroundColor Cyan
+        Write-Host "[*] `$Target '$Target' 解析出 $($resolved.Count) 个IP" -ForegroundColor Cyan
     } catch {
         Write-Host "[!] $($_.Exception.Message)" -ForegroundColor Red
         return
     }
 }
 
-if ($TargetFile) {
+if ($TargetFile -and $TargetFile.Trim() -ne '') {
     if (-not (Test-Path $TargetFile)) {
         Write-Host "[!] 找不到文件: $TargetFile" -ForegroundColor Red
         return
@@ -141,7 +143,7 @@ if ($TargetFile) {
             Write-Host "[!] 忽略文件中无法识别的行: $line" -ForegroundColor Yellow
         }
     }
-    Write-Host "[*] -TargetFile '$TargetFile' 解析出 $fileIpCount 个IP（共 $($lines.Count) 行）" -ForegroundColor Cyan
+    Write-Host "[*] `$TargetFile '$TargetFile' 解析出 $fileIpCount 个IP（共 $($lines.Count) 行）" -ForegroundColor Cyan
 }
 
 $ipList = $allIps | Sort-Object -Unique
@@ -173,13 +175,13 @@ function Parse-PortList([string]$portStr) {
 
 $PortList = Parse-PortList -portStr $Ports
 if ($PortList.Count -eq 0) {
-    Write-Host "[!] 端口参数解析为空，请检查 -Ports 写法。" -ForegroundColor Red
+    Write-Host "[!] 端口参数解析为空，请检查 `$Ports 写法。" -ForegroundColor Red
     return
 }
 Write-Host "[*] 待探测端口数量: $($PortList.Count)" -ForegroundColor Cyan
 
 $StatusFilterList = @()
-if ($StatusFilter -ne "") {
+if ($StatusFilter -and $StatusFilter.Trim() -ne "") {
     $StatusFilterList = $StatusFilter -split ',' | ForEach-Object { [int]$_.Trim() }
     Write-Host "[*] 仅记录状态码: $($StatusFilterList -join ', ')" -ForegroundColor Cyan
 }
@@ -274,7 +276,7 @@ if ($aliveList.Count -eq 0) {
 }
 
 # ---------- 第二步：端口 + Web 探测 ----------
-Write-Host "[*] 第二步：探测指定端口并抓取 Web 服务 title ..." -ForegroundColor Cyan
+Write-Host "[*] 第二步：探测指定端口并抓取 Web 服务信息 ..." -ForegroundColor Cyan
 
 $targets = foreach ($ip in $aliveList) {
     foreach ($port in $PortList) {
@@ -296,10 +298,12 @@ $ScriptBlock = {
         return ""
     }
 
-    # 发起请求，返回 [状态码, 响应体(最多读8KB用于取title)]
+    # 发起请求，返回 [状态码, 响应体(最多读2MB用于取title), 长度, 跳转目标]
     function Invoke-Probe($url, $Timeout) {
         $code = $null
         $body = ""
+        $length = 0
+        $location = ""
         try {
             $req = [System.Net.HttpWebRequest]::Create($url)
             $req.Method = "GET"
@@ -315,18 +319,26 @@ $ScriptBlock = {
             }
             if ($resp) {
                 $code = [int]$resp.StatusCode
+                if ($resp.Headers["Location"]) { $location = $resp.Headers["Location"] }
                 try {
                     $stream = $resp.GetResponseStream()
+                    $ms = New-Object System.IO.MemoryStream
                     $buffer = New-Object byte[] 8192
-                    $read = $stream.Read($buffer, 0, $buffer.Length)
-                    if ($read -gt 0) {
-                        $body = [System.Text.Encoding]::UTF8.GetString($buffer, 0, $read)
+                    $totalRead = 0
+                    $maxBytes = 2097152  # 最多读 2MB，避免大文件拖慢扫描
+                    while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                        $ms.Write($buffer, 0, $read)
+                        $totalRead += $read
+                        if ($totalRead -ge $maxBytes) { break }
                     }
+                    $bytes = $ms.ToArray()
+                    $body = [System.Text.Encoding]::UTF8.GetString($bytes)
+                    if ($resp.ContentLength -ge 0) { $length = $resp.ContentLength } else { $length = $totalRead }
                 } catch {}
                 $resp.Close()
             }
         } catch { }
-        return @($code, $body)
+        return @($code, $body, $length, $location)
     }
 
     # 1. TCP 端口连通性
@@ -341,40 +353,41 @@ $ScriptBlock = {
         $client.Close()
     } catch { return }
 
-    # 2. 判断 HTTP / HTTPS：访问根路径，能拿到响应就视为 Web 服务，并提取 title
-    $schemes = @('http', 'https')
-    foreach ($scheme in $schemes) {
+    # 2. http 和 https 都独立探测（不因为一个成功就跳过另一个，避免漏掉443等TLS端口）
+    #    https 握手比明文http慢，单独多给一点超时余量
+    $schemes = @(
+        @{ Scheme = 'http';  Extra = 0 },
+        @{ Scheme = 'https'; Extra = 700 }
+    )
 
-        $rootUrl = "$scheme`://$IP`:$Port/"
-        $rootResult = Invoke-Probe -url $rootUrl -Timeout $Timeout
-        $rootCode = $rootResult[0]
-        $rootBody = $rootResult[1]
+    foreach ($s in $schemes) {
+        $scheme = $s.Scheme
+        $effTimeout = $Timeout + $s.Extra
+        $url = "$scheme`://$IP`:$Port/"
 
-        if (-not $rootCode) {
-            # 该 scheme 完全连不通（协议不匹配等），尝试下一个 scheme
-            continue
-        }
+        $result = Invoke-Probe -url $url -Timeout $effTimeout
+        $code     = $result[0]
+        $body     = $result[1]
+        $length   = $result[2]
+        $location = $result[3]
 
-        $title = Get-PageTitle $rootBody
+        if (-not $code) { continue }  # 该 scheme 没拿到响应，跳过，不影响另一个scheme的探测
 
-        # 3. 是否记录：未指定 -StatusFilter 时记录所有拿到响应的结果；指定了则按状态码过滤
-        $shouldRecord = ($StatusFilterList.Count -eq 0) -or ($rootCode -in $StatusFilterList)
+        $title = Get-PageTitle $body
+
+        $shouldRecord = ($StatusFilterList.Count -eq 0) -or ($code -in $StatusFilterList)
 
         if ($shouldRecord) {
             $Results.Add([PSCustomObject]@{
-                IP     = $IP
-                Port   = $Port
-                Scheme = $scheme
-                Title  = $title
-                URL    = $rootUrl
-                Status = $rootCode
-                Time   = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+                URL      = $url
+                Status   = $code
+                Title    = $title
+                Length   = $length
+                Redirect = $location
             })
-            Write-Host "[HIT] $rootUrl -> $rootCode  Title: $title" -ForegroundColor Green
+            $redirInfo = if ($location) { "  -> $location" } else { "" }
+            Write-Host "[HIT] $url -> $code  Len:$length  Title:$title$redirInfo" -ForegroundColor Green
         }
-
-        # 该 scheme 已确认是 Web（能拿到根路径响应），不用再试另一个 scheme
-        break
     }
 }
 
@@ -404,12 +417,30 @@ $rsPool2.Close()
 $rsPool2.Dispose()
 
 # ---------- 输出结果 ----------
-$finalResults = $Results | Sort-Object IP, Port
+$finalResults = $Results | Sort-Object URL
 
 if ($finalResults.Count -gt 0) {
     $finalResults | Format-Table -AutoSize
-    $finalResults | Export-Csv -Path $OutFile -NoTypeInformation -Encoding UTF8
-    Write-Host "[+] 完成，共 $($finalResults.Count) 条命中记录，已保存至: $OutFile" -ForegroundColor Green
+
+    if ($OutFile -and $OutFile.Trim() -ne "") {
+        $ext = [System.IO.Path]::GetExtension($OutFile).ToLower()
+        switch ($ext) {
+            '.csv' {
+                $finalResults | Export-Csv -Path $OutFile -NoTypeInformation -Encoding UTF8
+            }
+            '.json' {
+                $finalResults | ConvertTo-Json -Depth 5 | Out-File -FilePath $OutFile -Encoding UTF8
+            }
+            default {
+                $lines = @("URL`tStatus`tTitle`tLength`tRedirect")
+                $lines += $finalResults | ForEach-Object { "$($_.URL)`t$($_.Status)`t$($_.Title)`t$($_.Length)`t$($_.Redirect)" }
+                $lines | Out-File -FilePath $OutFile -Encoding UTF8
+            }
+        }
+        Write-Host "[+] 完成，共 $($finalResults.Count) 条命中记录，已保存至: $OutFile" -ForegroundColor Green
+    } else {
+        Write-Host "[+] 完成，共 $($finalResults.Count) 条命中记录（未设置 `$OutFile，未保存文件）。" -ForegroundColor Green
+    }
 } else {
     Write-Host "[*] 完成，未发现符合条件的记录。" -ForegroundColor Yellow
 }
