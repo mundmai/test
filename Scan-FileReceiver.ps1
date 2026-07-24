@@ -169,8 +169,13 @@ function Parse-PortList([string]$portStr) {
 
 $PortSet = Parse-PortList -portStr $Ports
 if ($IncludeCommonPorts) {
-    $commonSet = Parse-PortList -portStr $CommonPorts
-    foreach ($p in $commonSet) { [void]$PortSet.Add($p) }
+    $commonSet = $null
+    if ($CommonPorts -and $CommonPorts.Trim() -ne '') {
+        $commonSet = Parse-PortList -portStr $CommonPorts
+    }
+    if ($commonSet -and $commonSet.Count -gt 0) {
+        foreach ($p in $commonSet) { [void]$PortSet.Add($p) }
+    }
 }
 $PortList = $PortSet | Sort-Object
 
