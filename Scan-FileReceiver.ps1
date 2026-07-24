@@ -1,49 +1,48 @@
 <#
 .SYNOPSIS
-    自定义网段/端口 Web 服务探测脚本，抓取根路径 title / length / 301302跳转目标。
+    自定义网段/端口资产探测脚本：Web服务抓取title/length/301302跳转，非Web端口做SSH/数据库等服务识别。
 
 .说明（务必阅读）
     本脚本仅可用于你拥有明确授权的网络/资产（内部资产梳理、授权渗透测试等）。
     禁止用于未授权的第三方网络扫描。使用前请确认已获得书面授权。
+    服务识别仅通过被动Banner抓取和极简单的无害协议探测（如Redis PING、Memcached version）完成，
+    对协议复杂的数据库（MSSQL/PostgreSQL/Oracle/MongoDB等）仅按端口号做"推测"标注，不做任何登录/利用行为。
 
 .用法（ISE 直接粘贴运行）
     把整段代码粘贴进 PowerShell ISE，直接修改下面【配置区】里的变量值，
     然后按 F5（或点绿色播放按钮）运行即可，不需要在命令行传参数。
 
 .配置区说明
-    $Target         目标网段，支持以下写法（留空则忽略，只用 $TargetFile）：
-                      C段简写   "192.168.1"                -> 等价于 192.168.1.0/24 (.1-.254)
-                      B段简写   "192.168"                   -> 等价于 192.168.0.0/16 (6万+地址)
-                      CIDR      "172.16.0.0/16" "10.1.2.0/28" -> 任意掩码
-                      IP范围    "192.168.1.1-192.168.3.254"  -> 起止IP范围
-                      单个IP    "192.168.1.10"
-    $TargetFile     从文件读取目标列表路径，每行一条，写法同上，支持混合。
-                    以 # 开头的行当注释忽略，空行忽略。可与 $Target 同时使用，结果合并去重。
-                    留空字符串 "" 表示不使用文件。
-    $Ports          要探测的端口，支持单个/逗号分隔/范围混合，例如 "80,443,8000-8090,7000-9999"
-    $Threads        并发线程数，默认 200
-    $Timeout        基础超时（毫秒），默认 1000；https 会在此基础上自动多留一些余量应对TLS握手
-    $OutFile        结果保存路径，留空 "" 则不保存文件，只在控制台显示。
-                    指定路径时按后缀名决定格式：.csv / .json / 其他(纯文本，制表符分隔)
-                    例如 "C:\result.csv"、".\result.json"、".\result.txt"
-    $StatusFilter   只记录指定状态码，逗号分隔，例如 "200,403,405"；留空 "" 则记录所有能拿到响应的结果
-    $SkipHostDiscovery  $true/$false，是否跳过存活探测直接扫全部目标IP的端口
-    $Force          $true/$false，目标IP数量超过65536时是否强制继续
+    $Target             目标网段，支持：C段简写"192.168.1"／B段简写"192.168"／CIDR"172.16.0.0/16"／
+                        IP范围"192.168.1.1-192.168.3.254"／单个IP。留空则只用 $TargetFile。
+    $TargetFile         从文件读取目标列表路径，每行一条，写法同上，# 开头当注释。可与 $Target 合并去重。
+    $Ports              要探测的自定义端口，支持单个/逗号/范围混合，例如 "7000-9999"，留空 "" 也可以只依赖常见端口库
+    $IncludeCommonPorts $true/$false，是否自动并入下面 $CommonPorts 常见端口库，默认 $true
+    $CommonPorts        常见服务默认端口库（Web/数据库/SSH等），可自行增删
+    $Threads            并发线程数，默认 200
+    $Timeout            基础超时（毫秒），默认 1000；https会自动多留余量
+    $OutFile            结果保存路径，留空 "" 则不保存文件；按后缀名决定格式 .csv/.json/其他(纯文本)
+    $StatusFilter       只记录指定HTTP状态码的Web结果，逗号分隔，例如 "200,403,405"；留空则记录所有Web响应。
+                        （不影响SSH/数据库等非Web服务的识别记录，那些只要识别到就会记录）
+    $SkipHostDiscovery  $true/$false，是否跳过存活探测直接扫全部目标IP
+    $Force              $true/$false，目标IP数量超过65536时是否强制继续
 #>
 
 # =====================================================================
 # ======================== 【配置区】在此修改 ==========================
 # =====================================================================
 
-$Target            = "192.168.1"                # 目标网段/IP/CIDR/范围，留空 "" 则只用 $TargetFile
-$TargetFile        = ""                          # IP列表文件路径，例如 "C:\ips.txt"，不用则留空 ""
-$Ports             = "80,443,7000-9999"          # 要探测的端口
-$Threads           = 200                         # 并发数
-$Timeout           = 1000                        # 基础超时(毫秒)，https会自动再加余量
-$OutFile           = ""                          # 留空则不保存文件；例如 ".\result.csv" ".\result.json" ".\result.txt"
-$StatusFilter      = ""                          # 例如 "200,403,405"，留空则记录所有响应
-$SkipHostDiscovery = $false                      # $true 则跳过存活探测，直接扫全部目标IP
-$Force             = $false                      # $true 则允许目标IP数超过65536继续执行
+$Target             = "192.168.1"                 # 目标网段/IP/CIDR/范围，留空 "" 则只用 $TargetFile
+$TargetFile         = ""                           # IP列表文件路径，不用则留空 ""
+$Ports              = "7000-9999"                  # 自定义要探测的端口，留空 "" 也可以只用常见端口库
+$IncludeCommonPorts = $true                        # 是否自动并入下面的常见端口库
+$CommonPorts        = "21,22,23,25,53,80,110,111,135,139,143,443,445,993,995,1433,1521,2049,2181,3306,3389,5000,5432,5601,5900,5984,6379,7001,8000,8080,8081,8443,8888,9000,9042,9092,9200,9300,11211,15672,27017,27018,50000,50070,61616"
+$Threads            = 200                          # 并发数
+$Timeout            = 1000                         # 基础超时(毫秒)，https会自动再加余量
+$OutFile            = ""                           # 留空则不保存文件；例如 ".\result.csv" ".\result.json" ".\result.txt"
+$StatusFilter       = ""                           # 例如 "200,403,405"，留空则记录所有Web响应
+$SkipHostDiscovery  = $false                       # $true 则跳过存活探测，直接扫全部目标IP
+$Force              = $false                       # $true 则允许目标IP数超过65536继续执行
 
 # =====================================================================
 # ======================== 以下为脚本逻辑，无需修改 =====================
@@ -66,7 +65,6 @@ function ConvertFrom-UInt32IP([uint64]$val) {
 function Resolve-TargetIPs([string]$target) {
     $target = $target.Trim()
 
-    # CIDR: a.b.c.d/nn
     if ($target -match '^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/(\d{1,2})$') {
         $baseIp = $matches[1]; $prefix = [int]$matches[2]
         $ipVal = ConvertTo-UInt32IP $baseIp
@@ -76,11 +74,10 @@ function Resolve-TargetIPs([string]$target) {
         $count = [uint64][math]::Pow(2, $hostBits)
         $first = $network + 1
         $last = $network + $count - 2
-        if ($prefix -ge 31) { $first = $network; $last = $network + $count - 1 } # /31,/32 特殊情况
+        if ($prefix -ge 31) { $first = $network; $last = $network + $count - 1 }
         return $first..$last | ForEach-Object { ConvertFrom-UInt32IP $_ }
     }
 
-    # IP范围: a.b.c.d-a.b.c.d
     if ($target -match '^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})-(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$') {
         $startVal = ConvertTo-UInt32IP $matches[1]
         $endVal   = ConvertTo-UInt32IP $matches[2]
@@ -88,17 +85,14 @@ function Resolve-TargetIPs([string]$target) {
         return $startVal..$endVal | ForEach-Object { ConvertFrom-UInt32IP $_ }
     }
 
-    # 单个完整IP: a.b.c.d
     if ($target -match '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$') {
         return @($target)
     }
 
-    # C段简写: a.b.c -> a.b.c.0/24
     if ($target -match '^\d{1,3}\.\d{1,3}\.\d{1,3}$') {
         return 1..254 | ForEach-Object { "$target.$_" }
     }
 
-    # B段简写: a.b -> a.b.0.0/16
     if ($target -match '^\d{1,3}\.\d{1,3}$') {
         $network = ConvertTo-UInt32IP "$target.0.0"
         $first = $network + 1
@@ -170,12 +164,18 @@ function Parse-PortList([string]$portStr) {
             Write-Host "[!] 忽略无法识别的端口写法: $part" -ForegroundColor Yellow
         }
     }
-    return ($ports | Sort-Object)
+    return $ports
 }
 
-$PortList = Parse-PortList -portStr $Ports
+$PortSet = Parse-PortList -portStr $Ports
+if ($IncludeCommonPorts) {
+    $commonSet = Parse-PortList -portStr $CommonPorts
+    foreach ($p in $commonSet) { [void]$PortSet.Add($p) }
+}
+$PortList = $PortSet | Sort-Object
+
 if ($PortList.Count -eq 0) {
-    Write-Host "[!] 端口参数解析为空，请检查 `$Ports 写法。" -ForegroundColor Red
+    Write-Host "[!] 端口列表为空，请检查 `$Ports / `$CommonPorts 设置。" -ForegroundColor Red
     return
 }
 Write-Host "[*] 待探测端口数量: $($PortList.Count)" -ForegroundColor Cyan
@@ -183,7 +183,7 @@ Write-Host "[*] 待探测端口数量: $($PortList.Count)" -ForegroundColor Cyan
 $StatusFilterList = @()
 if ($StatusFilter -and $StatusFilter.Trim() -ne "") {
     $StatusFilterList = $StatusFilter -split ',' | ForEach-Object { [int]$_.Trim() }
-    Write-Host "[*] 仅记录状态码: $($StatusFilterList -join ', ')" -ForegroundColor Cyan
+    Write-Host "[*] 仅记录Web状态码: $($StatusFilterList -join ', ')" -ForegroundColor Cyan
 }
 
 # ---------- 忽略无效 SSL 证书（仅用于探测，不做任何利用行为） ----------
@@ -205,7 +205,7 @@ public class TrustAllCertsPolicy {
 # ---------- 结果同步集合 ----------
 $Results = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
 
-# ---------- 存活探测：TCP 快速判活 + ICMP（逻辑直接内联进 ScriptBlock，避免跨 Runspace 传函数失效） ----------
+# ---------- 存活探测 ----------
 if ($SkipHostDiscovery) {
     Write-Host "[*] 已跳过存活探测，直接对全部 $($ipList.Count) 个IP 扫端口..." -ForegroundColor Cyan
     $aliveList = $ipList
@@ -217,10 +217,7 @@ $aliveHosts = [System.Collections.Concurrent.ConcurrentBag[string]]::new()
 
 $AliveScriptBlock = {
     param($IP, $aliveHosts)
-
     $isAlive = $false
-
-    # 1. 常见端口快速 TCP 判活
     $commonPorts = @(80, 443, 22, 445, 3389, 8080, 135, 139)
     foreach ($p in $commonPorts) {
         try {
@@ -235,8 +232,6 @@ $AliveScriptBlock = {
             $client.Close()
         } catch {}
     }
-
-    # 2. 端口都没命中的话，再补一次 ICMP
     if (-not $isAlive) {
         try {
             $ping = New-Object System.Net.NetworkInformation.Ping
@@ -244,7 +239,6 @@ $AliveScriptBlock = {
             if ($reply.Status -eq 'Success') { $isAlive = $true }
         } catch {}
     }
-
     if ($isAlive) { $aliveHosts.Add($IP) }
 }
 
@@ -268,15 +262,15 @@ $aliveList = $aliveHosts | Sort-Object -Unique
 Write-Host "[+] 存活主机数量: $($aliveList.Count)" -ForegroundColor Green
 $aliveList | ForEach-Object { Write-Host "    $_" }
 
-} # end else (SkipHostDiscovery)
+}
 
 if ($aliveList.Count -eq 0) {
     Write-Host "[!] 未发现存活主机，退出。" -ForegroundColor Yellow
     return
 }
 
-# ---------- 第二步：端口 + Web 探测 ----------
-Write-Host "[*] 第二步：探测指定端口并抓取 Web 服务信息 ..." -ForegroundColor Cyan
+# ---------- 第二步：端口 + Web / 服务 探测 ----------
+Write-Host "[*] 第二步：探测指定端口，识别Web服务(title/length/跳转)及SSH/数据库等服务 ..." -ForegroundColor Cyan
 
 $targets = foreach ($ip in $aliveList) {
     foreach ($port in $PortList) {
@@ -287,7 +281,17 @@ $targets = foreach ($ip in $aliveList) {
 $ScriptBlock = {
     param($IP, $Port, $Timeout, $Results, $StatusFilterList)
 
-    # 提取 <title> 的小函数（内联写，避免跨 Runspace 传函数失效的老问题）
+    # ---- 端口 -> 常见服务名 兜底映射表（仅用于协议复杂、未做主动识别时的推测标注）----
+    $PortServiceMap = @{
+        21 = "FTP"; 23 = "Telnet"; 25 = "SMTP"; 53 = "DNS"; 110 = "POP3"; 111 = "RPC";
+        135 = "MS-RPC"; 139 = "NetBIOS"; 143 = "IMAP"; 445 = "SMB"; 993 = "IMAPS"; 995 = "POP3S";
+        1433 = "MSSQL"; 1521 = "Oracle"; 2049 = "NFS"; 2181 = "Zookeeper"; 3389 = "RDP";
+        5432 = "PostgreSQL"; 5900 = "VNC"; 5984 = "CouchDB"; 7001 = "WebLogic";
+        9042 = "Cassandra"; 9092 = "Kafka"; 9300 = "Elasticsearch-Transport";
+        15672 = "RabbitMQ"; 27017 = "MongoDB"; 27018 = "MongoDB"; 50000 = "SAP";
+        50070 = "Hadoop"; 61616 = "ActiveMQ"
+    }
+
     function Get-PageTitle($body) {
         if ([string]::IsNullOrEmpty($body)) { return "" }
         $m = [regex]::Match($body, '<title[^>]*>\s*(.*?)\s*</title>', 'IgnoreCase, Singleline')
@@ -298,12 +302,8 @@ $ScriptBlock = {
         return ""
     }
 
-    # 发起请求，返回 [状态码, 响应体(最多读2MB用于取title), 长度, 跳转目标]
     function Invoke-Probe($url, $Timeout) {
-        $code = $null
-        $body = ""
-        $length = 0
-        $location = ""
+        $code = $null; $body = ""; $length = 0; $location = ""
         try {
             $req = [System.Net.HttpWebRequest]::Create($url)
             $req.Method = "GET"
@@ -312,11 +312,8 @@ $ScriptBlock = {
             $req.AllowAutoRedirect = $false
             $req.UserAgent = "Mozilla/5.0 (AssetScan)"
             $resp = $null
-            try {
-                $resp = $req.GetResponse()
-            } catch [System.Net.WebException] {
-                if ($_.Exception.Response) { $resp = $_.Exception.Response }
-            }
+            try { $resp = $req.GetResponse() }
+            catch [System.Net.WebException] { if ($_.Exception.Response) { $resp = $_.Exception.Response } }
             if ($resp) {
                 $code = [int]$resp.StatusCode
                 if ($resp.Headers["Location"]) { $location = $resp.Headers["Location"] }
@@ -325,7 +322,7 @@ $ScriptBlock = {
                     $ms = New-Object System.IO.MemoryStream
                     $buffer = New-Object byte[] 8192
                     $totalRead = 0
-                    $maxBytes = 2097152  # 最多读 2MB，避免大文件拖慢扫描
+                    $maxBytes = 2097152
                     while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
                         $ms.Write($buffer, 0, $read)
                         $totalRead += $read
@@ -341,54 +338,141 @@ $ScriptBlock = {
         return @($code, $body, $length, $location)
     }
 
+    # 被动Banner抓取：连上后不发任何数据，看服务是否主动吐banner（SSH/FTP/SMTP/POP3/IMAP/MySQL等常见）
+    function Get-Banner($IP, $Port, $Timeout) {
+        try {
+            $client = New-Object System.Net.Sockets.TcpClient
+            $iar = $client.BeginConnect($IP, $Port, $null, $null)
+            $ok = $iar.AsyncWaitHandle.WaitOne($Timeout, $false)
+            if (-not $ok -or -not $client.Connected) { $client.Close(); return "" }
+            $client.ReceiveTimeout = 600
+            $stream = $client.GetStream()
+            $buffer = New-Object byte[] 256
+            $read = 0
+            try { $read = $stream.Read($buffer, 0, $buffer.Length) } catch {}
+            $client.Close()
+            if ($read -gt 0) {
+                $raw = [System.Text.Encoding]::ASCII.GetString($buffer, 0, $read)
+                $clean = ($raw -replace '[^\x20-\x7E]', ' ').Trim()
+                return $clean
+            }
+        } catch {}
+        return ""
+    }
+
+    # 主动最简单探测：只对协议极简单、无害的服务发送标准探测命令（Redis PING / Memcached version）
+    function Invoke-SimpleProbe($IP, $Port, $Timeout, $sendBytes) {
+        try {
+            $client = New-Object System.Net.Sockets.TcpClient
+            $iar = $client.BeginConnect($IP, $Port, $null, $null)
+            $ok = $iar.AsyncWaitHandle.WaitOne($Timeout, $false)
+            if (-not $ok -or -not $client.Connected) { $client.Close(); return "" }
+            $stream = $client.GetStream()
+            $stream.Write($sendBytes, 0, $sendBytes.Length)
+            $stream.ReadTimeout = 600
+            $buffer = New-Object byte[] 256
+            $read = 0
+            try { $read = $stream.Read($buffer, 0, $buffer.Length) } catch {}
+            $client.Close()
+            if ($read -gt 0) {
+                $raw = [System.Text.Encoding]::ASCII.GetString($buffer, 0, $read)
+                return ($raw -replace '[^\x20-\x7E]', ' ').Trim()
+            }
+        } catch {}
+        return ""
+    }
+
     # 1. TCP 端口连通性
     try {
         $client = New-Object System.Net.Sockets.TcpClient
         $iar = $client.BeginConnect($IP, $Port, $null, $null)
         $ok = $iar.AsyncWaitHandle.WaitOne($Timeout, $false)
-        if (-not $ok -or -not $client.Connected) {
-            $client.Close()
-            return
-        }
+        if (-not $ok -or -not $client.Connected) { $client.Close(); return }
         $client.Close()
     } catch { return }
 
-    # 2. http 和 https 都独立探测（不因为一个成功就跳过另一个，避免漏掉443等TLS端口）
-    #    https 握手比明文http慢，单独多给一点超时余量
+    # 2. 先尝试 Web (http + https 都独立探测，避免漏掉443等TLS端口)
+    $webFound = $false
     $schemes = @(
         @{ Scheme = 'http';  Extra = 0 },
         @{ Scheme = 'https'; Extra = 700 }
     )
-
     foreach ($s in $schemes) {
         $scheme = $s.Scheme
         $effTimeout = $Timeout + $s.Extra
         $url = "$scheme`://$IP`:$Port/"
-
         $result = Invoke-Probe -url $url -Timeout $effTimeout
-        $code     = $result[0]
-        $body     = $result[1]
-        $length   = $result[2]
-        $location = $result[3]
+        $code = $result[0]; $body = $result[1]; $length = $result[2]; $location = $result[3]
+        if (-not $code) { continue }
 
-        if (-not $code) { continue }  # 该 scheme 没拿到响应，跳过，不影响另一个scheme的探测
-
+        $webFound = $true
         $title = Get-PageTitle $body
-
         $shouldRecord = ($StatusFilterList.Count -eq 0) -or ($code -in $StatusFilterList)
-
         if ($shouldRecord) {
             $Results.Add([PSCustomObject]@{
-                URL      = $url
+                IP       = $IP
+                Port     = $Port
+                Service  = $scheme.ToUpper()
+                Detail   = $title
                 Status   = $code
-                Title    = $title
                 Length   = $length
                 Redirect = $location
             })
             $redirInfo = if ($location) { "  -> $location" } else { "" }
-            Write-Host "[HIT] $url -> $code  Len:$length  Title:$title$redirInfo" -ForegroundColor Green
+            Write-Host "[HIT-WEB] $url -> $code  Len:$length  Title:$title$redirInfo" -ForegroundColor Green
         }
     }
+    if ($webFound) { return }
+
+    # 3. 不是 Web，做服务识别：先被动Banner抓取
+    $banner = Get-Banner -IP $IP -Port $Port -Timeout $Timeout
+    $service = ""
+    $detail = ""
+
+    if ($banner -ne "") {
+        if ($banner -match '^SSH-') { $service = "SSH"; $detail = $banner }
+        elseif ($banner -match '^220[\s-].*FTP') { $service = "FTP"; $detail = $banner }
+        elseif ($banner -match '^220[\s-]' -and $banner -match 'SMTP|ESMTP') { $service = "SMTP"; $detail = $banner }
+        elseif ($banner -match '^\+OK' -and $Port -eq 110) { $service = "POP3"; $detail = $banner }
+        elseif ($banner -match '^\*\s*OK' -and $Port -eq 143) { $service = "IMAP"; $detail = $banner }
+        elseif ($Port -eq 3306) { $service = "MySQL"; $detail = "Banner: $banner" }
+        elseif ($Port -eq 6379 -and $banner -match 'ERR|NOAUTH|WRONGTYPE') { $service = "Redis"; $detail = $banner }
+        else { $service = "Unknown"; $detail = $banner }
+    }
+
+    # 4. 无Banner时，对简单文本协议做一次无害主动探测
+    if ($service -eq "") {
+        if ($Port -eq 6379) {
+            $resp = Invoke-SimpleProbe -IP $IP -Port $Port -Timeout $Timeout -sendBytes ([System.Text.Encoding]::ASCII.GetBytes("PING`r`n"))
+            if ($resp -match '^\+PONG' -or $resp -match 'NOAUTH|ERR') { $service = "Redis"; $detail = $resp }
+        }
+        elseif ($Port -eq 11211) {
+            $resp = Invoke-SimpleProbe -IP $IP -Port $Port -Timeout $Timeout -sendBytes ([System.Text.Encoding]::ASCII.GetBytes("version`r`n"))
+            if ($resp -match '^VERSION') { $service = "Memcached"; $detail = $resp }
+        }
+    }
+
+    # 5. 仍未识别，按端口号兜底猜测（仅标注，不做协议交互）
+    if ($service -eq "") {
+        if ($PortServiceMap.ContainsKey($Port)) {
+            $service = "$($PortServiceMap[$Port])(端口推测)"
+            $detail = ""
+        } else {
+            $service = "Open/Unknown"
+            $detail = ""
+        }
+    }
+
+    $Results.Add([PSCustomObject]@{
+        IP       = $IP
+        Port     = $Port
+        Service  = $service
+        Detail   = $detail
+        Status   = ""
+        Length   = ""
+        Redirect = ""
+    })
+    Write-Host "[HIT-SVC] $IP`:$Port -> $service  $detail" -ForegroundColor Magenta
 }
 
 $rsPool2 = [runspacefactory]::CreateRunspacePool(1, $Threads)
@@ -417,7 +501,7 @@ $rsPool2.Close()
 $rsPool2.Dispose()
 
 # ---------- 输出结果 ----------
-$finalResults = $Results | Sort-Object URL
+$finalResults = $Results | Sort-Object IP, Port
 
 if ($finalResults.Count -gt 0) {
     $finalResults | Format-Table -AutoSize
@@ -425,21 +509,17 @@ if ($finalResults.Count -gt 0) {
     if ($OutFile -and $OutFile.Trim() -ne "") {
         $ext = [System.IO.Path]::GetExtension($OutFile).ToLower()
         switch ($ext) {
-            '.csv' {
-                $finalResults | Export-Csv -Path $OutFile -NoTypeInformation -Encoding UTF8
-            }
-            '.json' {
-                $finalResults | ConvertTo-Json -Depth 5 | Out-File -FilePath $OutFile -Encoding UTF8
-            }
+            '.csv' { $finalResults | Export-Csv -Path $OutFile -NoTypeInformation -Encoding UTF8 }
+            '.json' { $finalResults | ConvertTo-Json -Depth 5 | Out-File -FilePath $OutFile -Encoding UTF8 }
             default {
-                $lines = @("URL`tStatus`tTitle`tLength`tRedirect")
-                $lines += $finalResults | ForEach-Object { "$($_.URL)`t$($_.Status)`t$($_.Title)`t$($_.Length)`t$($_.Redirect)" }
+                $lines = @("IP`tPort`tService`tDetail`tStatus`tLength`tRedirect")
+                $lines += $finalResults | ForEach-Object { "$($_.IP)`t$($_.Port)`t$($_.Service)`t$($_.Detail)`t$($_.Status)`t$($_.Length)`t$($_.Redirect)" }
                 $lines | Out-File -FilePath $OutFile -Encoding UTF8
             }
         }
-        Write-Host "[+] 完成，共 $($finalResults.Count) 条命中记录，已保存至: $OutFile" -ForegroundColor Green
+        Write-Host "[+] 完成，共 $($finalResults.Count) 条记录，已保存至: $OutFile" -ForegroundColor Green
     } else {
-        Write-Host "[+] 完成，共 $($finalResults.Count) 条命中记录（未设置 `$OutFile，未保存文件）。" -ForegroundColor Green
+        Write-Host "[+] 完成，共 $($finalResults.Count) 条记录（未设置 `$OutFile，未保存文件）。" -ForegroundColor Green
     }
 } else {
     Write-Host "[*] 完成，未发现符合条件的记录。" -ForegroundColor Yellow
