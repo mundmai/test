@@ -75,29 +75,29 @@ function Resolve-TargetIPs([string]$target) {
         $first = $network + 1
         $last = $network + $count - 2
         if ($prefix -ge 31) { $first = $network; $last = $network + $count - 1 }
-        return $first..$last | ForEach-Object { ConvertFrom-UInt32IP $_ }
+        return ,@($first..$last | ForEach-Object { ConvertFrom-UInt32IP $_ })
     }
 
     if ($target -match '^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})-(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$') {
         $startVal = ConvertTo-UInt32IP $matches[1]
         $endVal   = ConvertTo-UInt32IP $matches[2]
         if ($startVal -gt $endVal) { $tmp = $startVal; $startVal = $endVal; $endVal = $tmp }
-        return $startVal..$endVal | ForEach-Object { ConvertFrom-UInt32IP $_ }
+        return ,@($startVal..$endVal | ForEach-Object { ConvertFrom-UInt32IP $_ })
     }
 
     if ($target -match '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$') {
-        return @($target)
+        return ,@($target)
     }
 
     if ($target -match '^\d{1,3}\.\d{1,3}\.\d{1,3}$') {
-        return 1..254 | ForEach-Object { "$target.$_" }
+        return ,@(1..254 | ForEach-Object { "$target.$_" })
     }
 
     if ($target -match '^\d{1,3}\.\d{1,3}$') {
         $network = ConvertTo-UInt32IP "$target.0.0"
         $first = $network + 1
         $last = $network + 65534
-        return $first..$last | ForEach-Object { ConvertFrom-UInt32IP $_ }
+        return ,@($first..$last | ForEach-Object { ConvertFrom-UInt32IP $_ })
     }
 
     throw "无法识别的目标写法: $target"
@@ -164,7 +164,7 @@ function Parse-PortList([string]$portStr) {
             Write-Host "[!] 忽略无法识别的端口写法: $part" -ForegroundColor Yellow
         }
     }
-    return $ports
+    return ,$ports
 }
 
 $PortSet = Parse-PortList -portStr $Ports
