@@ -168,6 +168,8 @@ function Parse-PortList([string]$portStr) {
 }
 
 $PortSet = Parse-PortList -portStr $Ports
+if (-not $PortSet) { $PortSet = [System.Collections.Generic.HashSet[int]]::new() }
+
 if ($IncludeCommonPorts) {
     $commonSet = $null
     if ($CommonPorts -and $CommonPorts.Trim() -ne '') {
